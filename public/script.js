@@ -1,0 +1,366 @@
+const $ = s => document.querySelector(s), app = $('#app');
+const LS = {
+  g: (k, d) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? d : v } catch (e) { return d } },
+  s: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)) } catch (e) { } }
+};
+const esc = t => String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+const shuf = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]] } return a };
+const fmt = s => String(s / 60 | 0).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+const norm = s => String(s).toLowerCase().replace(/&/g, 'and').replace(/[^a-z ]/g, ' ').replace(/\s+/g, ' ').trim();
+const today = () => new Date().toISOString().slice(0, 10);
+
+/* ---------- REST API Client ---------- */
+const API = {
+  token: localStorage.getItem('ax_token') || '',
+  async call(endpoint, method = 'GET', body = null) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (this.token) headers['Authorization'] = `Bearer ${this.token}`;
+    const opts = { method, headers };
+    if (body) opts.body = JSON.stringify(body);
+    try {
+      const res = await fetch('/api' + endpoint, opts);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Server returned status ${res.status}`);
+      }
+      return await res.json();
+    } catch (e) {
+      console.warn('API Client Fallback:', endpoint, e.message);
+      return null;
+    }
+  }
+};
+
+let RAW = [];
+const qScript = $('#qdata');
+if (qScript && qScript.textContent) {
+  try { RAW = JSON.parse(qScript.textContent); } catch (e) { }
+}
+
+/* ---------- Data layer: Express API + local fallback ---------- */
+const DB = {
+  ext: () => LS.g('ax_q', { add: [], del: [], cats: {} }),
+  all() {
+    const x = this.ext(), m = new Map();
+    RAW.forEach(q => m.set(q.id, q));
+    x.add.forEach(q => m.set(q.id, q));
+    x.del.forEach(i => m.delete(i));
+    return [...m.values()];
+  },
+  async init() {
+    const res = await API.call('/questions?limit=2000');
+    if (res && res.questions && res.questions.length > 0) {
+      RAW = res.questions;
+      const statusEl = $('#backend-status');
+      if (statusEl) statusEl.textContent = 'REST Backend Connected';
+    }
+  },
+  save(q) {
+    const x = this.ext();
+    x.add = x.add.filter(a => a.id !== q.id);
+    x.add.push(q);
+    x.del = x.del.filter(i => i !== q.id);
+    LS.s('ax_q', x);
+    API.call('/questions', 'POST', q);
+  },
+  del(id) {
+    const x = this.ext();
+    x.add = x.add.filter(a => a.id !== id);
+    x.del.push(id);
+    LS.s('ax_q', x);
+    API.call(`/questions/${id}`, 'DELETE');
+  },
+  nextId() { return Math.max(0, ...this.all().map(q => +q.id || 0)) + 1 },
+  clean(o) {
+    const q = {
+      id: o.id, category: o.category, topic: o.topic, subtopic: o.subtopic || o.topic,
+      difficulty: o.difficulty || 'Easy', question: o.question, options: o.options,
+      answer: o.answer, explanation: o.explanation || '', company: o.company || 'General',
+      exam: o.exam || 'Placement Practice', year: +o.year || new Date().getFullYear(),
+      question_type: o.question_type || 'MCQ', time_limit: +o.time_limit || 60,
+      marks: +o.marks || 1, negative_marks: +o.negative_marks || 0, tags: o.tags || []
+    };
+    if (!q.category || !q.topic || !q.question || !Array.isArray(q.options) || q.options.length < 2 || !q.options.includes(q.answer)) return null;
+    return q;
+  }
+};
+
+const BASE_CAT = {
+  'Quantitative Aptitude': ['Percentages', 'Profit & Loss', 'Average', 'Ratio & Proportion', 'Time & Work', 'Time, Speed & Distance', 'Simple Interest', 'Compound Interest', 'Probability', 'Permutation & Combination', 'Number System', 'HCF & LCM', 'Algebra', 'Ages', 'Mixtures', 'Data Interpretation'],
+  'Logical Reasoning': ['Number Series', 'Coding-Decoding', 'Blood Relations', 'Directions', 'Syllogisms', 'Seating Arrangement', 'Puzzles', 'Analogy', 'Classification', 'Statement & Conclusion', 'Data Sufficiency', 'Clocks', 'Calendars'],
+  'Verbal Ability': ['Reading Comprehension', 'Sentence Correction', 'Synonyms', 'Antonyms', 'Para Jumbles', 'Fill in the Blanks', 'Vocabulary', 'Grammar']
+};
+
+function catalog() {
+  const c = JSON.parse(JSON.stringify(BASE_CAT));
+  Object.entries(DB.ext().cats).forEach(([k, v]) => c[k] = [...new Set([...(c[k] || []), ...v])]);
+  DB.all().forEach(q => {
+    c[q.category] = c[q.category] || [];
+    if (!c[q.category].some(t => norm(t) === norm(q.topic))) c[q.category].push(q.topic);
+  });
+  return c;
+}
+
+const COMP = ['TCS', 'Infosys', 'Wipro', 'Accenture', 'Cognizant', 'Capgemini', 'Deloitte', 'IBM', 'EY', 'HCL', 'Tech Mahindra', 'Amazon', 'Microsoft', 'Other MNCs'];
+
+/* ---------- Auth & Progress ---------- */
+const hash = async s => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)))].map(b => b.toString(16).padStart(2, '0')).join('');
+let U = LS.g('ax_sess', null);
+const uid = () => U ? U.email : 'guest';
+const P = (id) => LS.g('ax_p_' + (id || uid()), { att: [], bm: [], mocks: [], rep: [] });
+const savP = p => LS.s('ax_p_' + uid(), p);
+const SC = () => LS.g('ax_sc', { c: 1, w: 0, u: 0 });
+const prep = q => ({ ...q, opts: shuf(q.options) });
+
+function rec(q, ok, sec) {
+  const p = P();
+  p.att.push({ id: q.id, topic: q.topic, cat: q.category, ok: +ok, sec, day: today() });
+  savP(p);
+  API.call('/user/attempt', 'POST', { id: q.id, topic: q.topic, cat: q.category, ok: +ok, sec });
+}
+
+/* ---------- UI Components ---------- */
+const Badge = d => { const n = { Easy: 1, Medium: 2, Hard: 3 }[d] || 1; return `<span class="bd d${n}" title="${esc(d)}">${'●'.repeat(n)}${'○'.repeat(3 - n)} ${esc(d)}</span>` };
+const Bar = (l, v, s = '%', m = 100) => `<div class="row"><span title="${esc(l)}">${esc(l)}</span><div class="trk"><i style="width:${Math.min(100, v / m * 100)}%"></i></div><b>${v}${s}</b></div>`;
+const DashCard = (v, l) => `<div class="card"><div class="big">${v}</div><span class="mut">${l}</span></div>`;
+const Timer = id => `<span class="timer" id="${id}">--:--</span>`;
+const TopicCard = (t, n, acc, fn) => `<div class="card"><b>${esc(t)}</b><div class="mut">${n ? n + ' questions' : 'Coming soon'}${acc == null ? '' : ' · your accuracy ' + acc + '%'}</div><button class="btn p" style="margin-top:8px" ${n ? '' : 'disabled'} onclick="${fn}">Practice</button></div>`;
+
+function QuestionCard(q, i, tot, sel, sub, fn, bm) {
+  return `<div class="card"><div class="top"><span class="mut">Question ${i + 1} of ${tot} · ${esc(q.topic)}</span>${Badge(q.difficulty)}</div><p><b>${esc(q.question)}</b></p>${q.opts.map((o, k) => {
+    let c = sel === o ? 'sel' : '';
+    if (sub) { c = o === q.answer ? 'ok' : sel === o ? 'no' : '' }
+    return `<button class="opt ${c}" ${sub ? 'disabled' : ''} onclick="${fn}(${k})">${'ABCDEF'[k]}. ${esc(o)}</button>`;
+  }).join('')}${sub ? `<div class="sol"><b class="${sel === q.answer ? 'ok-t' : 'bad-t'}">${sel === q.answer ? 'Correct' : 'Incorrect'}.</b> Answer: ${esc(q.answer)}<br>${esc(q.explanation)}</div>` : ''}</div>`;
+}
+
+function ResultCard(r) {
+  return `<div class="grid">${DashCard(r.correct + '/' + r.total, 'Score (' + r.score + ' marks)')}${DashCard(r.acc + '%', 'Accuracy')}${DashCard(fmt(r.took), 'Time taken')}${DashCard(r.att, 'Attempted')}${DashCard(r.correct, 'Correct')}${DashCard(r.wrong, 'Incorrect')}${DashCard(r.un, 'Unattempted')}</div>`;
+}
+
+/* ---------- Router ---------- */
+let view = 'Dashboard', tick = null, PR = null, MK = null, RES = null, A = { tab: 'stats' }, F = {};
+const NAVS = () => ['Dashboard', 'Topics', 'Practice Questions', 'Mock Test', 'Companies', 'Leaderboard', ...(U && U.admin ? ['Admin'] : []), U ? 'Logout' : 'Login'];
+
+function go(v) {
+  clearInterval(tick);
+  if (v === 'Logout') { U = null; API.token = ''; LS.s('ax_token', ''); LS.s('ax_sess', null); v = 'Login' }
+  view = v; PR = v === 'Practice' ? PR : null; render(); scrollTo(0, 0);
+}
+
+function render() {
+  $('#nav').innerHTML = NAVS().map(n => `<button class="${n === view ? 'on' : ''}" onclick="go('${n}')">${n}</button>`).join('');
+  const m = {
+    Dashboard: dash, Topics: topics, 'Practice Questions': browse, 'Mock Test': mockSetup,
+    Companies: companies, Leaderboard: board, Admin: admin, Login: () => auth('login'),
+    Signup: () => auth('signup'), Forgot: () => auth('forgot'), Practice: prShow,
+    Mock: mkShow, Result: resView, PEnd: pEnd
+  };
+  (m[view] || dash)();
+}
+
+/* ---------- Dashboard ---------- */
+function dash() {
+  const p = P(), n = p.att.length, ok = p.att.reduce((a, b) => a + b.ok, 0), acc = n ? Math.round(100 * ok / n) : 0, by = {};
+  p.att.forEach(a => { const b = by[a.topic] = by[a.topic] || { n: 0, ok: 0 }; b.n++; b.ok += a.ok });
+  const te = Object.entries(by).map(([k, v]) => [k, Math.round(100 * v.ok / v.n), v.n]).sort((a, b) => b[1] - a[1]);
+  const days = new Set([...p.att.map(a => a.day), ...p.mocks.map(m => m.day)]); let st = 0, d = new Date(); while (days.has(d.toISOString().slice(0, 10))) { st++; d.setDate(d.getDate() - 1) }
+  const avg = p.mocks.length ? Math.round(p.mocks.reduce((a, m) => a + m.acc, 0) / p.mocks.length) : 0;
+  const last7 = [...Array(7)].map((_, i) => { const x = new Date(); x.setDate(x.getDate() - 6 + i); const k = x.toISOString().slice(0, 10); return [k.slice(5), p.att.filter(a => a.day === k).length] });
+  app.innerHTML = `<div class="hero"><h1>AptitudeX — Aptitude & Reasoning Practice</h1><div>Practice smarter. Prepare better. Crack your placement exams.</div><p style="margin:10px 0 0">${U ? 'Signed in as ' + esc(U.name) : 'Practising as guest. Progress is saved locally & synced with backend. <a href="#" style="color:#fff" onclick="go(\'Login\');return false">Log in</a> for cloud sync.'}</p></div>
+ <h2>Your progress</h2><div class="grid">${DashCard(n, 'Attempted')}${DashCard(ok, 'Solved')}${DashCard(acc + '%', 'Accuracy')}${DashCard(st + ' 🔥', 'Day streak')}${DashCard(p.mocks.length, 'Mock tests')}${DashCard(avg + '%', 'Avg mock accuracy')}</div>
+ <div class="grid g2"><div><h2>Strongest topics</h2><div class="card">${te.slice(0, 4).map(t => Bar(t[0], t[1])).join('') || '<span class="mut">Practice to see data.</span>'}</div></div><div><h2>Weakest topics</h2><div class="card">${te.slice(-4).reverse().map(t => Bar(t[0], t[1])).join('') || '<span class="mut">Practice to see data.</span>'}</div></div></div>
+ <h2>Questions solved, last 7 days</h2><div class="card">${last7.map(x => Bar(x[0], x[1], '', Math.max(5, ...last7.map(y => y[1])))).join('')}</div>
+ <h2>Recent activity</h2><div class="card">${[...p.mocks.slice(-3).map(m => `${m.day}: ${esc(m.title)}, ${m.correct}/${m.total} (${m.acc}%)`), ...p.att.slice(-4).map(a => `${a.day}: ${esc(a.topic)}, ${a.ok ? 'correct' : 'incorrect'}`)].reverse().join('<br>') || '<span class="mut">No activity yet.</span>'}</div>
+ <p><button class="btn p" onclick="go('Topics')">Start practising</button> <button class="btn" onclick="go('Mock Test')">Take a mock test</button></p>`;
+}
+
+/* ---------- Topics ---------- */
+function topics() {
+  const c = catalog(), all = DB.all(), p = P(), by = {}; p.att.forEach(a => { const b = by[norm(a.topic)] = by[norm(a.topic)] || { n: 0, ok: 0 }; b.n++; b.ok += a.ok });
+  app.innerHTML = '<h1>Topics</h1><p class="mut">Pick a topic to practise one question at a time.</p>' + Object.entries(c).map(([k, ts]) => `<h2>${esc(k)}</h2><div class="grid g2">${ts.map(t => { const n = all.filter(q => q.category === k && norm(q.topic) === norm(t)).length, b = by[norm(t)]; return TopicCard(t, n, b ? Math.round(100 * b.ok / b.n) : null, `startTopic(${JSON.stringify(k).replace(/"/g, '&quot;')},${JSON.stringify(t).replace(/"/g, '&quot;')})`) }).join('')}</div>`).join('');
+}
+function startTopic(k, t) { startPractice(DB.all().filter(q => q.category === k && norm(q.topic) === norm(t)), t) }
+
+/* ---------- Practice mode ---------- */
+function startPractice(list, title) { if (!list.length) return alert('No questions match.'); PR = { title, qs: shuf(list).map(prep), i: 0, sel: {}, sub: {}, sp: {}, t: Date.now() }; view = 'Practice'; render() }
+function prShow() {
+  if (!PR) return go('Topics'); const q = PR.qs[PR.i], i = PR.i, bm = P().bm.includes(q.id);
+  app.innerHTML = `<div class="top"><h1>${esc(PR.title)}</h1><span class="mut">${Object.keys(PR.sub).length} submitted</span></div>${QuestionCard(q, i, PR.qs.length, PR.sel[i], PR.sub[i], 'pPick')}
+ <div class="top" style="margin-top:10px"><div><button class="btn" onclick="pGo(-1)" ${i ? '' : 'disabled'}>Previous</button> <button class="btn" onclick="toggleBm(${q.id})">${bm ? '★ Bookmarked' : '☆ Bookmark'}</button> <button class="btn" onclick="report(${q.id})">Report Question</button></div><div><button class="btn p" onclick="pSubmit()" ${PR.sub[i] ? 'disabled' : ''}>Submit</button> <button class="btn" onclick="pGo(1)">${i === PR.qs.length - 1 ? 'Finish' : 'Next'}</button></div></div>`;
+}
+function pPick(k) { if (PR.sub[PR.i]) return; PR.sel[PR.i] = PR.qs[PR.i].opts[k]; prShow() }
+function pSubmit() { const i = PR.i; if (PR.sel[i] == null) return alert('Select an option first.'); if (PR.sub[i]) return; PR.sub[i] = 1; PR.sp[i] = (PR.sp[i] || 0) + Math.round((Date.now() - PR.t) / 1000); PR.t = Date.now(); rec(PR.qs[i], PR.sel[i] === PR.qs[i].answer, PR.sp[i]); prShow() }
+function pGo(d) { PR.sp[PR.i] = (PR.sp[PR.i] || 0) + (PR.sub[PR.i] ? 0 : Math.round((Date.now() - PR.t) / 1000)); PR.t = Date.now(); const n = PR.i + d; if (n < 0) return; if (n >= PR.qs.length) { view = 'PEnd'; return render() } PR.i = n; prShow() }
+function pEnd() {
+  const ids = Object.keys(PR.sub), ok = ids.filter(i => PR.sel[i] === PR.qs[i].answer).length, t = ids.reduce((a, i) => a + (PR.sp[i] || 0), 0);
+  app.innerHTML = `<h1>Practice complete</h1><div class="grid">${DashCard(PR.qs.length, 'Questions')}${DashCard(ids.length, 'Answered')}${DashCard(ok, 'Correct')}${DashCard(ids.length - ok, 'Incorrect')}${DashCard(fmt(t), 'Time spent')}</div><p><button class="btn p" onclick="go('Topics')">More topics</button> <button class="btn" onclick="go('Dashboard')">Dashboard</button></p>`;
+}
+function toggleBm(id) { const p = P(), k = p.bm.indexOf(id); k < 0 ? p.bm.push(id) : p.bm.splice(k, 1); savP(p); API.call('/user/bookmark', 'POST', { questionId: id }); view === 'Practice' ? prShow() : browseList() }
+function report(id) { const r = prompt('What is wrong with this question?'); if (!r) return; const p = P(); p.rep.push({ id, note: r.slice(0, 300), day: today() }); savP(p); API.call('/user/report', 'POST', { id, note: r }); alert('Thanks, the report was saved for the admin.') }
+
+/* ---------- Practice Questions & Filters ---------- */
+let shown = 30;
+function browse() {
+  const all = DB.all(), u = k => [...new Set(all.map(q => k === 'tag' ? null : q[k]).filter(x => x != null))].sort(), tags = [...new Set(all.flatMap(q => q.tags || []))].sort();
+  const sel = (k, l, o) => `<select onchange="F.${k}=this.value;shown=30;browseList()" aria-label="${l}"><option value="">${l}</option>${o.map(x => `<option ${F[k] == x ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>`;
+  app.innerHTML = `<h1>Practice Questions</h1><div style="display:flex;gap:8px;flex-wrap:wrap"><input id="sq" type="search" placeholder="Search questions..." value="${esc(F.s || '')}" oninput="F.s=this.value;shown=30;browseList()" style="flex:1;min-width:200px">${sel('category', 'Category', u('category'))}${sel('topic', 'Topic', u('topic'))}${sel('difficulty', 'Difficulty', u('difficulty'))}${sel('exam', 'Exam', u('exam'))}${sel('company', 'Company', u('company'))}${sel('year', 'Year', u('year'))}${sel('question_type', 'Type', u('question_type'))}${sel('tag', 'Tag', tags)}${sel('bm', 'Saved', ['Bookmarked', 'Attempted wrongly'])}</div><p><button class="btn" onclick="F={};browse()">Clear filters</button> <button class="btn p" onclick="startPractice(filtered(),'Filtered practice')">Practise these</button></p><div id="lst"></div>`; browseList()
+}
+function filtered() { const p = P(), wrong = new Set(p.att.filter(a => !a.ok).map(a => a.id)), s = (F.s || '').toLowerCase(); return DB.all().filter(q => (!s || (q.question + ' ' + q.topic + ' ' + (q.tags || []).join(' ')).toLowerCase().includes(s)) && ['category', 'topic', 'difficulty', 'exam', 'company', 'year', 'question_type'].every(k => !F[k] || String(q[k]) === F[k]) && (!F.tag || (q.tags || []).includes(F.tag)) && (F.bm !== 'Bookmarked' || p.bm.includes(q.id)) && (F.bm !== 'Attempted wrongly' || wrong.has(q.id))) }
+function browseList() {
+  const l = filtered(), p = P(); if (!$('#lst')) return; $('#lst').innerHTML = `<p class="mut">${l.length} questions</p>` + l.slice(0, shown).map(q => `<div class="card" style="margin:8px 0"><div class="top"><span class="tag">${esc(q.topic)}</span>${Badge(q.difficulty)}</div><p style="margin:6px 0"><b>${esc(q.question)}</b></p><button class="btn p" onclick="startPractice([DB.all().find(x=>x.id===${q.id})],'Single question')">Attempt</button> <button class="btn" onclick="toggleBm(${q.id})">${p.bm.includes(q.id) ? '★' : '☆'}</button> <span class="mut">${esc(q.company)} · ${esc(q.exam)} · ${q.year}</span></div>`).join('') + (l.length > shown ? `<button class="btn" onclick="shown+=30;browseList()">Show more</button>` : '')
+}
+
+/* ---------- Mock tests ---------- */
+function mockSetup(co) {
+  const c = catalog(); const title = typeof co === 'string' ? co : '';
+  app.innerHTML = `<h1>${title ? esc(title) + ' company-style mock' : 'Mock test'}</h1>${title ? '<div class="note">Company-style Practice: questions are practice questions in a typical recruitment pattern.</div>' : ''}<div class="card" style="margin-top:12px"><label>Number of questions</label><select id="mn">${[10, 20, 30, 50, 100].map(n => `<option>${n}</option>`).join('')}</select><label>Difficulty</label><select id="md"><option>Mixed</option><option>Easy</option><option>Medium</option><option>Hard</option></select><label>Category</label><select id="mc"><option value="">All categories</option>${Object.keys(c).map(k => `<option>${esc(k)}</option>`).join('')}</select><p class="mut">Time allowed is the sum of each question's time limit. Marking: +${SC().c} correct, −${SC().w} incorrect, ${SC().u} unattempted.</p><button class="btn p" onclick="mockStart('${esc(title)}')">Start mock test</button></div>`
+}
+function mockStart(title, pool, n, tt) {
+  const d = $('#md') && $('#md').value, c = $('#mc') && $('#mc').value; n = n || +$('#mn').value; pool = pool || DB.all().filter(q => (!c || q.category === c) && (!d || d === 'Mixed' || q.difficulty === d));
+  if (!pool.length) return alert('No questions match these settings yet.'); const qs = shuf(pool).slice(0, n).map(prep), secs = qs.reduce((a, q) => a + (q.time_limit || 60), 0);
+  MK = { title: tt || title || 'Mock test', qs, ans: {}, i: 0, t0: Date.now(), end: Date.now() + secs * 1000, short: qs.length < n }; view = 'Mock'; render()
+}
+function mkShow() {
+  if (!MK) return go('Mock Test'); const q = MK.qs[MK.i];
+  app.innerHTML = `<div class="top"><h2 style="margin:0">${esc(MK.title)}</h2><span>Time Remaining: ${Timer('tm')}</span></div>${MK.short ? `<div class="note">Only ${MK.qs.length} questions matched, so the test is shorter than requested.</div>` : ''}<div style="margin-top:10px">${QuestionCard(q, MK.i, MK.qs.length, MK.ans[MK.i], false, 'mPick')}</div>
+ <div class="top"><div><button class="btn" onclick="mGo(-1)">Previous</button> <button class="btn" onclick="delete MK.ans[MK.i];mkShow()">Clear</button></div><div><button class="btn" onclick="mGo(1)">Next</button> <button class="btn p" onclick="if(confirm('Submit the test?'))mSubmit()">Submit</button></div></div>
+ <div class="pal">${MK.qs.map((_, i) => `<button class="${MK.ans[i] != null ? 'a' : ''} ${i === MK.i ? 'c' : ''}" onclick="MK.i=${i};mkShow()">${i + 1}</button>`).join('')}</div>`;
+  clearInterval(tick); const f = () => { const l = Math.max(0, Math.round((MK.end - Date.now()) / 1000)), e = $('#tm'); if (e) e.textContent = fmt(l); if (l <= 0) { clearInterval(tick); mSubmit() } }; f(); tick = setInterval(f, 1000)
+}
+function mPick(k) { MK.ans[MK.i] = MK.qs[MK.i].opts[k]; mkShow() }
+function mGo(d) { MK.i = Math.min(MK.qs.length - 1, Math.max(0, MK.i + d)); mkShow() }
+async function mSubmit() {
+  clearInterval(tick); if (!MK) return; const sc = SC(), took = Math.min(Math.round((Date.now() - MK.t0) / 1000), Math.round((MK.end - MK.t0) / 1000)), topics = {}; let c = 0, w = 0;
+  MK.qs.forEach((q, i) => { const t = topics[q.topic] = topics[q.topic] || { n: 0, ok: 0 }; t.n++; if (MK.ans[i] != null) { if (MK.ans[i] === q.answer) { c++; t.ok++ } else w++ } });
+  const tot = MK.qs.length, att = c + w, r = {
+    title: MK.title, day: today(), total: tot, att, correct: c, wrong: w, un: tot - att, score: +(c * sc.c - w * sc.w - (tot - att) * sc.u).toFixed(2), acc: att ? Math.round(100 * c / att) : 0, took, topics,
+    review: MK.qs.map((q, i) => ({ q: q.question, topic: q.topic, you: MK.ans[i] == null ? null : MK.ans[i], ans: q.answer, ex: q.explanation }))
+  };
+  const p = P(); MK.qs.forEach((q, i) => { if (MK.ans[i] != null) p.att.push({ id: q.id, topic: q.topic, cat: q.category, ok: +(MK.ans[i] === q.answer), sec: Math.round(took / att), day: today() }) });
+  p.mocks.push({ ...r, review: undefined }); savP(p); RES = r;
+  API.call('/mocks/submit', 'POST', { title: MK.title, questions: MK.qs, answers: MK.ans, timeSpentSeconds: took });
+  MK = null; view = 'Result'; render()
+}
+function resView() {
+  const r = RES; if (!r) return go('Dashboard'); const te = Object.entries(r.topics).map(([k, v]) => [k, Math.round(100 * v.ok / v.n)]), weak = te.filter(t => t[1] < 60).map(t => t[0]);
+  app.innerHTML = `<h1>Results: ${esc(r.title)}</h1>${ResultCard(r)}<h2>Topic performance</h2><div class="card">${te.map(t => Bar(t[0], t[1])).join('')}</div>
+ <h2>Recommendation</h2><div class="card">${weak.length ? `You need more practice in ${esc(weak.join(' and '))}.<br><button class="btn p" style="margin-top:8px" onclick="weakPractice()">Practice Weak Topics</button>` : 'Strong performance across all topics. Try a harder or longer mock.'}</div>
+ <h2>Review</h2>${r.review.map((x, i) => `<div class="card" style="margin:8px 0"><b>${i + 1}. ${esc(x.q)}</b><div class="${x.you === x.ans ? 'ok-t' : 'bad-t'}">Your answer: ${x.you == null ? 'Not attempted' : esc(x.you)}</div><div>Correct answer: ${esc(x.ans)}</div><div class="sol">${esc(x.ex)}</div></div>`).join('')}`
+}
+function weakPractice() { const w = Object.entries(RES.topics).filter(([k, v]) => v.ok / v.n < .6).map(x => x[0]); startPractice(DB.all().filter(q => w.includes(q.topic)), 'Weak topics practice') }
+
+/* ---------- Companies ---------- */
+function companies() { app.innerHTML = `<h1>Company preparation</h1><div class="note">Company-style Practice only.</div><div class="grid g2" style="margin-top:12px">${COMP.map(c => { const n = DB.all().filter(q => q.company === c).length; return `<div class="card"><b>${c}</b><div class="mut">Company-style Practice${n ? ' · ' + n + ' tagged questions' : ''}</div><button class="btn p" style="margin-top:8px" onclick="companyMock('${c}')">Start</button></div>` }).join('')}</div>` }
+function companyMock(c) { const own = DB.all().filter(q => q.company === c); mockStart(c + ' company-style mock', own.length >= 10 ? own : DB.all(), 20, c + ' company-style mock') }
+
+/* ---------- Leaderboard ---------- */
+async function board() {
+  const apiRes = await API.call('/leaderboard');
+  const p = P(), m = p.mocks, me = m.length ? { n: (U ? U.name : 'You (guest)'), s: Math.max(...m.map(x => x.score)), a: Math.round(m.reduce((a, x) => a + x.acc, 0) / m.length), t: m.length } : null;
+  const rows = (apiRes && apiRes.leaderboard) ? apiRes.leaderboard : [...[['Aarav S.', 92, 88, 14], ['Priya K.', 88, 85, 12], ['Rohan M.', 81, 79, 9], ['Sneha R.', 76, 74, 7], ['Kiran T.', 70, 68, 5]].map(x => ({ n: x[0], s: x[1], a: x[2], t: x[3], demo: 1 })), ...(me ? [me] : [])].sort((a, b) => b.s - a.s || b.a - a.a);
+  app.innerHTML = `<h1>Leaderboard</h1><div class="note">Synced with AptitudeX REST Server backend.</div><div class="card sc" style="margin-top:12px"><table><tr><th>Rank</th><th>Student</th><th>Score</th><th>Accuracy</th><th>Tests</th></tr>${rows.map((r, i) => `<tr ${r.demo ? '' : 'style="font-weight:700"'}><td>${i + 1}</td><td>${esc(r.n)}${r.demo ? ' <span class="mut">(demo)</span>' : ''}</td><td>${r.s}</td><td>${r.a}%</td><td>${r.t}</td></tr>`).join('')}</table></div>`;
+}
+
+/* ---------- Auth ---------- */
+function auth(m) {
+  const f = (id, l, t = 'text') => `<label>${l}</label><input id="${id}" type="${t}" autocomplete="off" style="width:100%">`;
+  app.innerHTML = `<div style="max-width:420px;margin:auto"><h1>${{ login: 'Log in', signup: 'Sign up', forgot: 'Reset password' }[m]}</h1><div class="note">Accounts sync directly with AptitudeX Express Backend & JWT. First account becomes admin automatically.</div><div class="card" style="margin-top:12px">${m === 'signup' ? f('an', 'Name') : ''}${f('ae', 'Email', 'email')}${m === 'forgot' ? f('ar', 'Recovery phrase') : ''}${f('ap', m === 'forgot' ? 'New password' : 'Password', 'password')}${m === 'signup' ? f('ar', 'Recovery phrase (used to reset your password)') : ''}<p><button class="btn p" onclick="doAuth('${m}')">${{ login: 'Log in', signup: 'Create account', forgot: 'Reset password' }[m]}</button></p><p class="mut">${m === 'login' ? `<a href="#" onclick="go('Signup');return false">Create an account</a> · <a href="#" onclick="go('Forgot');return false">Forgot password?</a>` : `<a href="#" onclick="go('Login');return false">Back to log in</a>`}</p></div></div>`;
+}
+async function doAuth(m) {
+  const g = id => ($('#' + id) ? $('#' + id).value.trim() : ''), e = g('ae').toLowerCase(), pw = $('#ap').value;
+  if (!e || !pw) return alert('Enter your email and password.'); if (m !== 'login' && pw.length < 6) return alert('Use at least 6 characters.');
+
+  if (m === 'signup') {
+    const res = await API.call('/auth/signup', 'POST', { email: e, name: g('an'), password: pw, recoveryPhrase: g('ar') });
+    if (!res || res.error) return alert(res ? res.error : 'Could not create account');
+    API.token = res.token; LS.s('ax_token', res.token); U = res.user; LS.s('ax_sess', U); alert('Account created!'); go('Dashboard');
+  } else if (m === 'forgot') {
+    const res = await API.call('/auth/forgot', 'POST', { email: e, recoveryPhrase: g('ar'), newPassword: pw });
+    if (!res || res.error) return alert(res ? res.error : 'Password reset failed');
+    alert(res.message); go('Login');
+  } else {
+    const res = await API.call('/auth/login', 'POST', { email: e, password: pw });
+    if (!res || res.error) return alert(res ? res.error : 'Login failed');
+    API.token = res.token; LS.s('ax_token', res.token); U = res.user; LS.s('ax_sess', U); go('Dashboard');
+  }
+}
+
+/* ---------- Admin ---------- */
+function admin() {
+  if (!U || !U.admin) { return app.innerHTML = '<h1>Admin</h1><p>Log in with an admin account to manage questions and server config.</p>' }
+  const tabs = ['stats', 'questions', 'add', 'import/export', 'categories', 'scoring']; const all = DB.all(); let h = '';
+  if (A.tab === 'stats') { const us = LS.g('ax_users', {}), ps = Object.keys(us).map(e => P(e)), rep = ps.flatMap(p => p.rep); h = `<div class="grid">${DashCard(all.length, 'Questions')}${DashCard(Object.keys(us).length || 1, 'Users')}${DashCard(ps.reduce((a, p) => a + p.att.length, 0), 'Attempts')}${DashCard(ps.reduce((a, p) => a + p.mocks.length, 0), 'Mock tests')}${DashCard(rep.length, 'Reports')}</div><h2>Status</h2><div class="card">Express REST Backend is running with REST API endpoints available.</div>` }
+  if (A.tab === 'questions') { const s = (A.s || '').toLowerCase(), l = all.filter(q => !s || (q.question + q.topic + q.id).toLowerCase().includes(s)); h = `<input type="search" placeholder="Search questions..." value="${esc(A.s || '')}" oninput="A.s=this.value;admin();$('#as')&&$('#as').focus()" id="as"><p class="mut">${l.length} matches (first 40 shown)</p>${l.slice(0, 40).map(q => `<div class="card" style="margin:6px 0"><span class="mut">#${q.id} · ${esc(q.topic)}</span> ${Badge(q.difficulty)}<br>${esc(q.question)}<br><button class="btn" onclick="editQ(${q.id})">Edit</button> <button class="btn" onclick="if(confirm('Delete question ${q.id}?')){DB.del(${q.id});admin()}">Delete</button></div>`).join('')}` }
+  if (A.tab === 'add') { const q = A.q || {}, c = catalog(); h = `<div class="card"><label>Category</label><select id="fc">${Object.keys(c).map(k => `<option ${q.category === k ? 'selected' : ''}>${esc(k)}</option>`).join('')}</select><label>Topic</label><input id="ft" value="${esc(q.topic || '')}" list="tl"><datalist id="tl">${[...new Set(Object.values(c).flat())].map(t => `<option>${esc(t)}</option>`).join('')}</datalist><label>Difficulty</label><select id="fd">${['Easy', 'Medium', 'Hard'].map(d => `<option ${q.difficulty === d ? 'selected' : ''}>${d}</option>`).join('')}</select><label>Question</label><textarea id="fq">${esc(q.question || '')}</textarea><label>Options (one per line)</label><textarea id="fo">${esc((q.options || []).join('\n'))}</textarea><label>Correct answer (must match an option)</label><input id="fa" value="${esc(q.answer || '')}" style="width:100%"><label>Explanation</label><textarea id="fe">${esc(q.explanation || '')}</textarea><label>Company</label><input id="fy" value="${esc(q.company || 'General')}"><label>Tags (comma separated)</label><input id="fg" value="${esc((q.tags || []).join(', '))}" style="width:100%"><p><button class="btn p" onclick="saveQ()">${q.id ? 'Save changes to #' + q.id : 'Add question'}</button></p></div>` }
+  if (A.tab === 'import/export') { h = `<div class="card"><b>Import JSON</b><input type="file" accept=".json" onchange="impFile(this)"><label>Or paste here</label><textarea id="ip"></textarea><button class="btn p" onclick="imp($('#ip').value)">Import</button></div><div class="card" style="margin-top:12px"><b>Export JSON</b><p class="mut">Export every question from backend DB.</p><button class="btn" onclick="exp()">Copy all as JSON</button><textarea id="ex" readonly style="display:none"></textarea></div>` }
+  if (A.tab === 'categories') { h = `<div class="card"><label>New category</label><input id="nc"> <button class="btn" onclick="addCat()">Create category</button><label>New topic</label><select id="ntc">${Object.keys(catalog()).map(k => `<option>${esc(k)}</option>`).join('')}</select> <input id="nt"> <button class="btn" onclick="addTopic()">Create topic</button></div>` }
+  if (A.tab === 'scoring') { const s = SC(); h = `<div class="card"><label>Marks per correct answer</label><input id="sc1" type="number" step="any" value="${s.c}"><label>Marks deducted per incorrect answer</label><input id="sc2" type="number" step="any" value="${s.w}"><label>Marks deducted per unattempted</label><input id="sc3" type="number" step="any" value="${s.u}"><p><button class="btn p" onclick="LS.s('ax_sc',{c:+$('#sc1').value,w:Math.abs($('#sc2').value),u:Math.abs($('#sc3').value)});API.call('/config/scoring','POST',{c:+$('#sc1').value,w:Math.abs($('#sc2').value),u:Math.abs($('#sc3').value)});alert('Scoring saved.')">Save scoring</button></p></div>` }
+  app.innerHTML = `<h1>Admin</h1><div style="margin:8px 0">${tabs.map(t => `<button class="btn ${A.tab === t ? 'p' : ''}" onclick="A.tab='${t}';A.q=null;admin()">${t}</button>`).join(' ')}</div><div class="note">Admin tools sync with Node.js Express REST server.</div><div style="margin-top:12px">${h}</div>`;
+}
+function editQ(id) { A.q = DB.all().find(q => q.id === id); A.tab = 'add'; admin() }
+function saveQ() {
+  const o = { ...(A.q || {}), id: A.q ? A.q.id : DB.nextId(), category: $('#fc').value, topic: $('#ft').value.trim(), difficulty: $('#fd').value, question: $('#fq').value.trim(), options: $('#fo').value.split('\n').map(x => x.trim()).filter(Boolean), answer: $('#fa').value.trim(), explanation: $('#fe').value.trim(), company: $('#fy').value.trim() || 'General', tags: $('#fg').value.split(',').map(x => x.trim()).filter(Boolean) }, q = DB.clean(o);
+  if (!q) return alert('Check the form: category, topic, question, at least two options, and an answer that matches one option.'); DB.save({ ...o, ...q }); A.q = null; A.tab = 'questions'; admin(); alert('Saved question #' + q.id)
+}
+function imp(t) {
+  let rows; try { t = t.trim(); rows = JSON.parse(t) } catch (e) { return alert('Could not read JSON: ' + e.message) }
+  API.call('/questions/import', 'POST', { questions: rows }); alert('Imported questions.'); admin()
+}
+function impFile(i) { const f = i.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => imp(r.result); r.readAsText(f) }
+function exp() { const t = JSON.stringify(DB.all(), null, 1), e = $('#ex'); e.style.display = 'block'; e.value = t; e.style.minHeight = '200px'; e.select(); try { navigator.clipboard.writeText(t).then(() => alert('Copied ' + DB.all().length + ' questions.'), () => { }) } catch (x) { } }
+function addCat() { const n = $('#nc').value.trim(); if (!n) return; const x = DB.ext(); x.cats[n] = x.cats[n] || []; LS.s('ax_q', x); admin() }
+function addTopic() { const n = $('#nt').value.trim(), c = $('#ntc').value; if (!n) return; const x = DB.ext(); x.cats[c] = [...(x.cats[c] || []), n]; LS.s('ax_q', x); admin() }
+
+/* ---------- Magical Canvas Layer ---------- */
+const FX = (() => {
+  const c = $('#fx'); let x = null; try { x = c.getContext('2d') } catch (e) { } if (!x) return { burst() { } };
+  const RM = !!(window.matchMedia && matchMedia('(prefers-reduced-motion:reduce)').matches), light = () => { const t = document.documentElement.dataset.theme; return t === 'light' || (!t && window.matchMedia && matchMedia('(prefers-color-scheme:light)').matches) };
+  let W, H, ps = [], f = 0; const rs = () => { W = c.width = innerWidth; H = c.height = innerHeight }; rs(); addEventListener('resize', rs);
+  const mk = (X, Y, vx, vy, l, h, r) => { if (ps.length < 420) ps.push({ x: X, y: Y, vx, vy, l, m: l, h, r }) };
+  if (!RM) for (let i = 0; i < 36; i++) mk(Math.random() * W, Math.random() * H, (Math.random() - .5) * .3, -.15 - Math.random() * .3, 1e9, Math.random() * 50, 1 + Math.random() * 1.5);
+  addEventListener('pointermove', e => { if (!RM && Math.random() < .45) mk(e.clientX, e.clientY, (Math.random() - .5) * 1.2, (Math.random() - .5) * 1.2 - .3, 38, Math.random() * 50, 2) });
+  addEventListener('pointerdown', e => { if (!RM) burst(e.clientX, e.clientY, 12) });
+  function burst(X, Y, n, h) { for (let i = 0; i < (n || 30); i++) { const a = Math.random() * 6.283, s = 1 + Math.random() * 5; mk(X,Y, Math.cos(a) * s, Math.sin(a) * s, 50 + Math.random() * 35, h == null ? Math.random() * 50 : h + Math.random() * 30, 2 + Math.random() * 2) } }
+  (function loop() {
+    f++; x.clearRect(0, 0, W, H); const L = light(); x.globalCompositeOperation = L ? 'source-over' : 'lighter';
+    ps = ps.filter(p => {
+      const amb = p.l > 1e8; p.x += p.vx; p.y += p.vy; if (amb) { if (p.y < -10) { p.y = H + 10; p.x = Math.random() * W } } else { p.l--; p.vy += .04; p.vx *= .99 }
+      const a = amb ? .25 + .2 * Math.sin(f / 25 + p.x) : p.l / p.m; if (a <= 0) return false; x.fillStyle = `hsla(${p.h},100%,${L ? 42 : 65}%,${a * (L ? .7 : 1)})`; x.beginPath(); x.arc(p.x, p.y, p.r * 3, 0, 6.283); x.globalAlpha = .18; x.fill(); x.beginPath(); x.arc(p.x, p.y, p.r, 0, 6.283); x.globalAlpha = 1; x.fill(); return true
+    }); requestAnimationFrame(loop)
+  })();
+  return { burst }
+})();
+
+const HAPPY = [['🐉', 'Ember Dragon', 'roars in praise of your logic!'], ['🦄', 'Aurora Unicorn', 'gallops in on a rainbow of correct answers!'], ['🦊', 'Star Fox', 'leaps out of the portal to cheer you on!'], ['🧚', 'Pixie of Insight', 'sprinkles stardust on your answer!'], ['🦉', 'Sage Owl', 'nods wisely. Well solved!'], ['🐲', 'Jade Wyrm', 'coils around your victory!']];
+const SAD = [['👻', 'Fog Phantom', 'stole that answer. Read the explanation, then tap to banish it!'], ['🧌', 'Bridge Troll', 'blocks your path. Tap to banish it after reviewing the solution.'], ['🦇', 'Gloom Bat', 'swoops in. Tap to banish it once you understand the fix.'], ['🐙', 'Tangle Kraken', 'tangled your steps. Tap to banish it!'], ['🕷️', 'Web Weaver', 'trapped that answer in a web. Tap to banish it!']];
+const lvl = x => 1 + Math.floor(x / 100);
+
+function mana(add) { const p = P(); p.xp = (p.xp || 0) + (add || 0); if (add) savP(p); const x = p.xp, e = $('#mana'); if (e) e.innerHTML = `<span>Lv ${lvl(x)}</span><div class="trk"><i style="width:${x % 100}%"></i></div>`; if (add && lvl(x - add) < lvl(x)) { FX.burst(innerWidth / 2, innerHeight / 2, 80); creature('🌟', 'Level up!', 'You reached level ' + lvl(x) + '. The realm grows brighter!', 1) } }
+function creature(em, name, line, good) {
+  document.querySelectorAll('.crt').forEach(e => e.remove()); const d = document.createElement('div'); d.className = 'crt ' + (good ? 'good' : 'bad'); d.setAttribute('role', 'status');
+  d.innerHTML = `<div class="bub"><b>${esc(name)}</b><br>${esc(line)}</div><div class="em">${em}</div>`; document.body.appendChild(d); const at = () => { const r = d.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height * .7] };
+  setTimeout(() => { const [X, Y] = at(); FX.burst(X, Y, good ? 45 : 35, good ? null : 260) }, 600); let done = 0; const out = () => { if (done) return; done = 1; d.classList.add('out'); setTimeout(() => d.remove(), 450) };
+  d.onclick = () => { const [X, Y] = at(); if (good) { d.classList.add('hop'); setTimeout(() => d.classList.remove('hop'), 700); FX.burst(X, Y, 25) } else { FX.burst(X, Y, 60, 40); const p = P(); p.ban = (p.ban || 0) + 1; savP(p); mana(3); out() } };
+  setTimeout(out, good ? 4500 : 8000)
+}
+function react(ok) { const a = ok ? HAPPY : SAD, c = a[Math.random() * a.length | 0]; if (ok) { const p = P(); p.bst = p.bst || {}; p.bst[c[0]] = (p.bst[c[0]] || 0) + 1; savP(p) } mana(ok ? 10 : 2); creature(c[0], c[1], c[2], ok) }
+function bestiaryHTML() { const p = P(), b = p.bst || {}; return `<h2>Creature collection</h2><div class="card"><div class="mut">Summon friends by answering correctly. Wrong answers call shadow creatures; tap them to banish. Banished so far: ${p.ban || 0}</div><div class="zoo">${HAPPY.map(c => `<div class="pet ${b[c[0]] ? '' : 'lock'}"><span>${c[0]}</span><small>${b[c[0]] ? esc(c[1]) + ' ×' + b[c[0]] : 'Not yet summoned'}</small></div>`).join('')}</div></div>` }
+
+const _pS = pSubmit; pSubmit = function () { const i = PR && PR.i, was = PR && PR.sub[i]; _pS(); if (PR && !was && PR.sub[i]) react(PR.sel[i] === PR.qs[i].answer) };
+const _rv = resView; resView = function () { _rv(); if (RES) { const g = RES.acc >= 60 && RES.att > 0, a = g ? HAPPY : SAD, c = a[Math.random() * a.length | 0]; mana(Math.round(RES.acc / 2)); setTimeout(() => creature(c[0], g ? 'Realm conquered!' : c[1], g ? c[1] + ' celebrates your score of ' + RES.acc + '%!' : c[2], g), 500) } };
+const _d = dash; dash = function () { _d(); app.insertAdjacentHTML('beforeend', bestiaryHTML()) };
+const _r = render; render = function () { _r(); mana() };
+
+(function () {
+  const el = $('#intro'); if (!el) return; let seen = null; try { seen = sessionStorage.getItem('ax_in') } catch (e) { } if (seen) { el.remove(); return }
+  const mark = () => { try { sessionStorage.setItem('ax_in', '1') } catch (e) { } };
+  $('#skip').onclick = () => { mark(); el.remove() };
+  $('#enter').onclick = () => { mark(); el.classList.add('go'); FX.burst(innerWidth / 2, innerHeight * .42, 80); setTimeout(() => { el.remove(); creature('🦉', 'Sage Owl', 'Welcome, traveller! Answer questions to summon creatures.', 1) }, 1000) };
+  try { $('#enter').focus() } catch (e) { }
+})();
+
+$('#th').onclick = () => { const r = document.documentElement, l = r.dataset.theme === 'light' || (!r.dataset.theme && matchMedia('(prefers-color-scheme:light)').matches); r.dataset.theme = l ? 'dark' : 'light' };
+
+// Boot system
+DB.init().then(() => render());
