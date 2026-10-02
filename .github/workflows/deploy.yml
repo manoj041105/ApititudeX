@@ -1,0 +1,36 @@
+name: AptitudeX CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install dependencies
+      run: npm install
+
+    - name: Test Server Boot & Seeding
+      run: |
+        node seed.js
+        node -e "const { readDb } = require('./db'); const db = readDb(); console.log('Seeded questions:', db.questions.length); if (db.questions.length < 1) process.exit(1);"
+
+    - name: Verify API endpoints
+      run: |
+        node server.js &
+        SERVER_PID=$!
+        sleep 3
+        curl -s http://localhost:5000/api/health | grep '"status":"ok"'
+        kill $SERVER_PID
